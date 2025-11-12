@@ -16,7 +16,7 @@ namespace VKBotRaw
         private static async Task Main()
         {
             Console.OutputEncoding = System.Text.Encoding.UTF8;
-            Console.WriteLine("🚀 Запуск VK Bot через HTTP...");
+            Console.WriteLine("🚀 Запуск VK Bot...");
 
             using HttpClient client = new HttpClient();
             var jsonOptions = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
@@ -52,8 +52,6 @@ namespace VKBotRaw
                         var poll = JsonSerializer.Deserialize<LongPollUpdate>(pollResponse, jsonOptions);
                         if (poll == null)
                         {
-                            Console.WriteLine("⚠️ Ответ VK пустой или некорректный:");
-                            Console.WriteLine(pollResponse);
                             continue;
                         }
 
@@ -76,7 +74,6 @@ namespace VKBotRaw
                                 string reply;
                                 string? keyboard = null;
 
-                                // Логика меню
                                 switch (msg.ToLower())
                                 {
                                     case "/start":
@@ -91,11 +88,11 @@ namespace VKBotRaw
                                         break;
 
                                     case "время работы":
-                                        reply = "Аквапарк работает с 10:00 до 22:00 каждый день";
+                                        reply = "Аквапарк работает с 10:00 до 21:00 каждый день";
                                         break;
 
                                     case "контакты":
-                                        reply = "Телефон: +7 (123) 456-78-90\nАдрес: г. Вашгород, ул. Водная, 1";
+                                        reply = "Контакты\r\nПозвонить в Центр YES: (8172) 33-06-06\r\n\r\nНаписать е-mail: yes@yes35.ru \r\n\r\nЕдиная горячая линия по улучшению сервиса в ресторане: 8-800-200-67-71\r\n\r\nНайти YES ВКонтакте\nhttps://vk.com/yes35\r\n\r\nТолько самые интересные и актуальные новости, а также выгодные специальные предложения  в  Телеграм\nhttps://t.me/CentreYES35\r\n\r\nВсё лучшее детям! Предложения для групп в  WhatsApp\nhttps://chat.whatsapp.com/I4uygcAgoir7nyNoyYuMjL";
                                         break;
 
                                     case "назад":
@@ -143,7 +140,7 @@ namespace VKBotRaw
             }
         }
 
-        // Клавиатуры
+        // Главная клавиатура
         private static string MainMenuKeyboard()
         {
             return JsonSerializer.Serialize(new
@@ -161,6 +158,7 @@ namespace VKBotRaw
             });
         }
 
+        // Подменю информации
         private static string InfoMenuKeyboard()
         {
             return JsonSerializer.Serialize(new
@@ -178,25 +176,39 @@ namespace VKBotRaw
             });
         }
 
-        // Получение загруженности аквапарка
+        // Получение загруженности через API
         private static async Task<string> GetParkLoadAsync(HttpClient client)
         {
             try
             {
-                var html = await client.GetStringAsync("https://aqua.yes35.ru/index.html");
-                var start = html.IndexOf("data-people=\"") + "data-people=\"".Length;
-                var end = html.IndexOf("\"", start);
-                var visitors = html.Substring(start, end - start);
-                return $"Сейчас в аквапарке приблизительно: {visitors} человек";
+                var requestData = new { SiteID = "1" };
+                var response = await client.PostAsJsonAsync("https://apigateway.nordciti.ru/v1/aqua/CurrentLoad", requestData);
+
+                if (!response.IsSuccessStatusCode)
+                    return "Не удалось получить данные о загруженности 😔";
+
+                var data = await response.Content.ReadFromJsonAsync<ParkLoadResponse>();
+
+                if (data == null)
+                    return "Не удалось обработать ответ сервера 😔";
+
+                return $"Сейчас аквапарк загружен примерно на {data.Load}% ({data.Count} человек)";
             }
             catch
             {
                 return "Не удалось получить данные о загруженности 😔";
             }
         }
+
+        // Модель для ответа API
+        public class ParkLoadResponse
+        {
+            public int Count { get; set; }
+            public int Load { get; set; }
+        }
     }
 
-    // Модели
+    // Модели VK Long Poll
     public class LongPollServerResponse { public LongPollServer Response { get; set; } = null!; }
     public class LongPollServer { public string Key { get; set; } = null!; public string Server { get; set; } = null!; public string Ts { get; set; } = null!; }
     public class LongPollUpdate { public string Ts { get; set; } = null!; public UpdateItem[] Updates { get; set; } = Array.Empty<UpdateItem>(); }
