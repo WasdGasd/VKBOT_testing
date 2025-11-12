@@ -10,6 +10,7 @@
   <ItemGroup>
     <PackageReference Include="HtmlAgilityPack" Version="1.12.4" />
     <PackageReference Include="PuppeteerSharp" Version="20.2.4" />
+    <PackageReference Include="VkNet" Version="1.78.0" />
   </ItemGroup>
 
 </Project>
