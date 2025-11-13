@@ -6,9 +6,159 @@ using System.Text.Json.Serialization;
 using System.Threading.Tasks;
 using System.Linq;
 using System.Collections.Concurrent;
+using Npgsql;
+using System.Data.Common;
+using Microsoft.Data.Sqlite;
+
+
+using System.Collections.Generic;
 
 namespace VKBotRaw
 {
+    // 📋 Модели для базы данных ошибок
+    public class ErrorLog
+    {
+        public int Id { get; set; }
+        public DateTime Timestamp { get; set; } = DateTime.Now;
+        public string ErrorLevel { get; set; } = "ERROR";
+        public string ErrorMessage { get; set; } = "";
+        public string StackTrace { get; set; } = "";
+        public long? UserId { get; set; }
+        public long? ChatId { get; set; }
+        public string? Command { get; set; }
+        public string? AdditionalData { get; set; }
+    }
+
+    // 🔧 Класс для логирования ошибок в БД
+    public class ErrorLogger
+    {
+        private readonly string _connectionString;
+
+        public ErrorLogger(string databasePath = "errors.db")
+        {
+            _connectionString = $"Data Source={databasePath}";
+            InitializeDatabase();
+        }
+
+        private void InitializeDatabase()
+        {
+            try
+            {
+                using var connection = new SqliteConnection(_connectionString);
+                connection.Open();
+
+                var createTableCommand = @"
+                CREATE TABLE IF NOT EXISTS error_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    error_level TEXT,
+                    error_message TEXT,
+                    stack_trace TEXT,
+                    user_id INTEGER,
+                    chat_id INTEGER,
+                    command TEXT,
+                    additional_data TEXT
+                )";
+
+                using var command = new SqliteCommand(createTableCommand, connection);
+                command.ExecuteNonQuery();
+                Console.WriteLine("✅ SQLite таблица error_logs готова");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"❌ Ошибка при создании таблицы: {ex.Message}");
+            }
+        }
+
+        public async Task LogErrorAsync(Exception error,
+                              string errorLevel = "ERROR",
+                              long? userId = null,
+                              long? chatId = null,
+                              string? command = null,
+                              object? additionalData = null)
+        {
+            try
+            {
+                await using var connection = new SqliteConnection(_connectionString); // ИЗМЕНИТЬ НА SqliteConnection
+                await connection.OpenAsync();
+
+                var additionalDataJson = additionalData != null
+                    ? JsonSerializer.Serialize(additionalData, new JsonSerializerOptions
+                    {
+                        WriteIndented = false,
+                        PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+                    })
+                    : null;
+
+                var sqlQuery = @"
+                INSERT INTO error_logs 
+                (error_level, error_message, stack_trace, user_id, chat_id, command, additional_data)
+                VALUES (@errorLevel, @errorMessage, @stackTrace, @userId, @chatId, @command, @additionalData)";
+
+                await using var dbCommand = new SqliteCommand(sqlQuery, connection); // ИЗМЕНИТЬ НА SqliteCommand
+                dbCommand.Parameters.AddWithValue("@errorLevel", errorLevel);
+                dbCommand.Parameters.AddWithValue("@errorMessage", error.Message);
+                dbCommand.Parameters.AddWithValue("@stackTrace", error.StackTrace ?? "");
+                dbCommand.Parameters.AddWithValue("@userId", userId ?? (object)DBNull.Value);
+                dbCommand.Parameters.AddWithValue("@chatId", chatId ?? (object)DBNull.Value);
+                dbCommand.Parameters.AddWithValue("@command", command ?? (object)DBNull.Value);
+                dbCommand.Parameters.AddWithValue("@additionalData", additionalDataJson ?? (object)DBNull.Value);
+
+                await dbCommand.ExecuteNonQueryAsync();
+
+                Console.WriteLine($"📝 Ошибка записана в БД: {error.Message}");
+            }
+            catch (Exception dbError)
+            {
+                // Резервное логирование в консоль
+                Console.WriteLine($"❌ Не удалось записать ошибку в БД: {dbError.Message}");
+                Console.WriteLine($"📝 Исходная ошибка: {error.Message}");
+                Console.WriteLine($"🔍 StackTrace: {error.StackTrace}");
+            }
+        }
+
+        public async Task<List<ErrorLog>> GetRecentErrorsAsync(int limit = 10)
+        {
+            var errors = new List<ErrorLog>();
+
+            try
+            {
+                await using var connection = new SqliteConnection(_connectionString); // ИЗМЕНИТЬ НА SqliteConnection
+                await connection.OpenAsync();
+
+                var selectCommand = @"
+                SELECT timestamp, error_level, error_message, user_id, command, additional_data
+                FROM error_logs 
+                ORDER BY timestamp DESC 
+                LIMIT @limit";
+
+                await using var command = new SqliteCommand(selectCommand, connection); // ИЗМЕНИТЬ НА SqliteCommand
+                command.Parameters.AddWithValue("@limit", limit);
+
+                await using var reader = await command.ExecuteReaderAsync();
+
+                while (await reader.ReadAsync())
+                {
+                    errors.Add(new ErrorLog
+                    {
+                        Timestamp = reader.GetDateTime(0),
+                        ErrorLevel = reader.GetString(1),
+                        ErrorMessage = reader.GetString(2),
+                        UserId = reader.IsDBNull(3) ? null : reader.GetInt64(3),
+                        Command = reader.IsDBNull(4) ? null : reader.GetString(4),
+                        AdditionalData = reader.IsDBNull(5) ? null : reader.GetString(5)
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"❌ Ошибка при получении ошибок: {ex.Message}");
+            }
+
+            return errors;
+        }
+    }
+
     internal class Program
     {
         // 🔑 Токен доступа сообщества
@@ -20,6 +170,9 @@ namespace VKBotRaw
         // ⚙️ Версия API VK
         private static string apiVersion = "5.131";
 
+        // 🔧 Логгер ошибок
+        private static ErrorLogger? _errorLogger;
+
         // Словарь для хранения выбранной пользователем даты и сеанса
         private static readonly ConcurrentDictionary<long, (string date, string session)> userSelectedData = new();
 
@@ -28,14 +181,22 @@ namespace VKBotRaw
             Console.OutputEncoding = System.Text.Encoding.UTF8;
             Console.WriteLine("🚀 Запуск VK Bot...");
 
+            // Инициализация логгера ошибок
+            _errorLogger = new ErrorLogger("errors.db");
+            //_errorLogger = new ErrorLogger("Host=localhost;Database=vk_bot_errors;Username=utest;Password=123123;Port=5432");
+
             using HttpClient client = new HttpClient();
             var jsonOptions = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
 
             try
             {
                 Console.WriteLine("🔹 Получаю данные Long Poll сервера...");
-                var serverResponse = await client.GetFromJsonAsync<LongPollServerResponse>(
-                    $"https://api.vk.com/method/groups.getLongPollServer?group_id={groupId}&access_token={token}&v={apiVersion}"
+
+                var serverResponse = await ExecuteWithLoggingAsync(
+                    () => client.GetFromJsonAsync<LongPollServerResponse>(
+                        $"https://api.vk.com/method/groups.getLongPollServer?group_id={groupId}&access_token={token}&v={apiVersion}"
+                    ),
+                    client: client
                 );
 
                 if (serverResponse?.Response == null)
@@ -64,13 +225,38 @@ namespace VKBotRaw
 
                         foreach (var update in poll.Updates)
                         {
-                            // 🟢 Новый пользователь разрешил сообщения
-                            if (update.Type == "message_allow" && update.Object?.UserId != null)
-                            {
-                                var userId = update.Object.UserId.Value;
-                                Console.WriteLine($"👋 Новый пользователь разрешил сообщения: {userId}");
+                            await ProcessUpdateWithLoggingAsync(update, client);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"❌ Ошибка цикла: {ex.Message}");
+                        await _errorLogger!.LogErrorAsync(ex, "CRITICAL",
+                            additionalData: new { Component = "MainLoop" });
+                        await Task.Delay(3000);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"💥 Ошибка при инициализации: {ex.Message}");
+                await _errorLogger!.LogErrorAsync(ex, "FATAL",
+                    additionalData: new { Component = "Initialization" });
+            }
+        }
 
-                                string welcomeText = "🌊 ДОБРО ПОЛОЖАЛОВАТЬ В ЦЕНТР YES!\n\n" +
+        // 🔄 Обработка обновлений с логированием ошибок
+        private static async Task ProcessUpdateWithLoggingAsync(UpdateItem update, HttpClient client)
+        {
+            try
+            {
+                // 🟢 Новый пользователь разрешил сообщения
+                if (update.Type == "message_allow" && update.Object?.UserId != null)
+                {
+                    var userId = update.Object.UserId.Value;
+                    Console.WriteLine($"👋 Новый пользователь разрешил сообщения: {userId}");
+
+                    string welcomeText = "🌊 ДОБРО ПОЛОЖАЛОВАТЬ В ЦЕНТР YES!\n\n" +
 "Я ваш персональный помощник для организации незабываемого отдыха! 🎯\n\n" +
 
 "🎟 УМНАЯ ПОКУПКА БИЛЕТОВ\n" +
@@ -96,174 +282,261 @@ namespace VKBotRaw
 "Выберите раздел в меню ниже, и я помогу организовать ваш идеальный визит! ✨\n\n" +
 "💫 Центр YES - где рождаются воспоминания!";
 
-                                string keyboard = JsonSerializer.Serialize(new
-                                {
-                                    one_time = true,
-                                    buttons = new[] { new[] { new { action = new { type = "text", label = "🚀 Начать" }, color = "positive" } } }
-                                });
-
-                                string url =
-                                    $"https://api.vk.com/method/messages.send?user_id={userId}" +
-                                    $"&random_id={Environment.TickCount}" +
-                                    $"&message={Uri.EscapeDataString(welcomeText)}" +
-                                    $"&keyboard={Uri.EscapeDataString(keyboard)}" +
-                                    $"&access_token={token}&v={apiVersion}";
-
-                                await client.GetStringAsync(url);
-                                continue;
-                            }
-
-                            // 💬 Входящие сообщения
-                            if (update.Type == "message_new" && update.Object?.Message != null)
-                            {
-                                var msg = update.Object.Message.Text ?? "";
-                                var userId = update.Object.Message.FromId;
-
-                                Console.WriteLine($"💬 Новое сообщение от {userId}: {msg}");
-
-                                string reply;
-                                string? keyboard = null;
-
-                                // Улучшенная обработка категорий билетов
-                                if (IsTicketCategoryMessage(msg))
-                                {
-                                    if (userSelectedData.TryGetValue(userId, out var ticketData))
-                                    {
-                                        string selectedCategory = GetTicketCategoryFromMessage(msg);
-                                        var tariffResult = await GetFormattedTariffsAsync(client, ticketData.date, ticketData.session, selectedCategory);
-                                        reply = tariffResult.message;
-                                        keyboard = tariffResult.keyboard;
-                                    }
-                                    else
-                                    {
-                                        reply = "Сначала выберите дату и сеанс 📅";
-                                        keyboard = TicketsDateKeyboard();
-                                    }
-                                }
-                                else
-                                {
-                                    switch (msg.ToLower())
-                                    {
-                                        case "/start":
-                                        case "начать":
-                                        case "🚀 начать":
-                                            reply = "Добро пожаловать! Выберите пункт 👇";
-                                            keyboard = MainMenuKeyboard();
-                                            break;
-
-                                        case "информация":
-                                        case "ℹ️ информация":
-                                            reply = "Выберите интересующую информацию 👇";
-                                            keyboard = InfoMenuKeyboard();
-                                            break;
-
-                                        case "время работы":
-                                        case "⏰ время работы":
-                                            reply = GetWorkingHours();
-                                            break;
-
-                                        case "контакты":
-                                        case "📞 контакты":
-                                            reply = GetContacts();
-                                            break;
-
-                                        case "🔙 назад":
-                                        case "назад":
-                                            reply = "Главное меню:";
-                                            keyboard = MainMenuKeyboard();
-                                            userSelectedData.TryRemove(userId, out _);
-                                            break;
-
-                                        case "🔙 к сеансам":
-                                            if (userSelectedData.TryGetValue(userId, out var sessionData))
-                                            {
-                                                reply = $"Выберите сеанс для даты {sessionData.date}:";
-                                                var sessionResult = await GetSessionsForDateAsync(client, sessionData.date);
-                                                keyboard = sessionResult.keyboard;
-                                            }
-                                            else
-                                            {
-                                                reply = "Выберите дату для сеанса:";
-                                                keyboard = TicketsDateKeyboard();
-                                            }
-                                            break;
-
-                                        case "🔙 в начало":
-                                            reply = "Главное меню:";
-                                            keyboard = MainMenuKeyboard();
-                                            userSelectedData.TryRemove(userId, out _);
-                                            break;
-
-                                        case "🎟 купить билеты":
-                                        case "билеты":
-                                            reply = "Выберите дату для сеанса:";
-                                            keyboard = TicketsDateKeyboard();
-                                            break;
-
-                                        case "📊 загруженность":
-                                        case "загруженность":
-                                            reply = await GetParkLoadAsync(client);
-                                            break;
-
-                                        default:
-                                            if (msg.StartsWith("📅")) // выбор даты
-                                            {
-                                                string dateStr = msg.Replace("📅", "").Trim();
-                                                var sessionResult = await GetSessionsForDateAsync(client, dateStr);
-                                                reply = sessionResult.message;
-                                                keyboard = sessionResult.keyboard;
-
-                                                // Сохраняем дату для пользователя
-                                                userSelectedData[userId] = (dateStr, "");
-                                            }
-                                            else if (msg.StartsWith("⏰")) // выбор сеанса
-                                            {
-                                                string sessionTime = msg.Replace("⏰", "").Trim();
-
-                                                // Получаем дату из предыдущего выбора пользователя
-                                                if (!userSelectedData.TryGetValue(userId, out var currentData))
-                                                {
-                                                    reply = "Сначала выберите дату 📅";
-                                                    keyboard = TicketsDateKeyboard();
-                                                }
-                                                else
-                                                {
-                                                    userSelectedData[userId] = (currentData.date, sessionTime);
-                                                    reply = $"🎟 *Сеанс: {sessionTime} ({currentData.date})*\n\nВыберите категорию билетов:";
-                                                    keyboard = TicketCategoryKeyboard();
-                                                }
-                                            }
-                                            else
-                                            {
-                                                reply = "Я вас не понял, попробуйте еще раз 😅";
-                                            }
-                                            break;
-                                    }
-                                }
-
-                                string sendUrl =
-                                    $"https://api.vk.com/method/messages.send?user_id={userId}" +
-                                    $"&random_id={Environment.TickCount}" +
-                                    $"&message={Uri.EscapeDataString(reply)}" +
-                                    $"&access_token={token}&v={apiVersion}";
-
-                                if (keyboard != null)
-                                    sendUrl += $"&keyboard={Uri.EscapeDataString(keyboard)}";
-
-                                await client.GetStringAsync(sendUrl);
-                            }
-                        }
-                    }
-                    catch (Exception ex)
+                    string keyboard = JsonSerializer.Serialize(new
                     {
-                        Console.WriteLine($"❌ Ошибка цикла: {ex.Message}");
-                        await Task.Delay(3000);
-                    }
+                        one_time = true,
+                        buttons = new[] { new[] { new { action = new { type = "text", label = "🚀 Начать" }, color = "positive" } } }
+                    });
+
+                    string url =
+                        $"https://api.vk.com/method/messages.send?user_id={userId}" +
+                        $"&random_id={Environment.TickCount}" +
+                        $"&message={Uri.EscapeDataString(welcomeText)}" +
+                        $"&keyboard={Uri.EscapeDataString(keyboard)}" +
+                        $"&access_token={token}&v={apiVersion}";
+
+                    await ExecuteWithLoggingAsync(
+                        () => client.GetStringAsync(url),
+                        userId: userId,
+                        command: "WELCOME_MESSAGE"
+                    );
+                    return;
+                }
+
+                // 💬 Входящие сообщения
+                if (update.Type == "message_new" && update.Object?.Message != null)
+                {
+                    await ProcessMessageWithLoggingAsync(update.Object.Message, client);
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"💥 Ошибка при инициализации: {ex.Message}");
+                long? userId = update.Object?.UserId ?? update.Object?.Message?.FromId;
+                await _errorLogger!.LogErrorAsync(ex, "ERROR", userId,
+                    additionalData: new { UpdateType = update.Type, RawUpdate = JsonSerializer.Serialize(update) });
+            }
+        }
+
+        // 💬 Обработка сообщений с логированием ошибок
+        private static async Task ProcessMessageWithLoggingAsync(MessageItem message, HttpClient client)
+        {
+            var msg = message.Text ?? "";
+            var userId = message.FromId;
+
+            Console.WriteLine($"💬 Новое сообщение от {userId}: {msg}");
+
+            string reply;
+            string? keyboard = null;
+
+            try
+            {
+                // Улучшенная обработка категорий билетов
+                if (IsTicketCategoryMessage(msg))
+                {
+                    if (userSelectedData.TryGetValue(userId, out var ticketData))
+                    {
+                        string selectedCategory = GetTicketCategoryFromMessage(msg);
+                        var tariffResult = await ExecuteWithLoggingAsync(
+                            () => GetFormattedTariffsAsync(client, ticketData.date, ticketData.session, selectedCategory),
+                            userId: userId,
+                            command: $"TARIFF_{selectedCategory.ToUpper()}",
+                            contextData: new { Date = ticketData.date, Session = ticketData.session, Category = selectedCategory }
+                        );
+                        reply = tariffResult.message;
+                        keyboard = tariffResult.keyboard;
+                    }
+                    else
+                    {
+                        reply = "Сначала выберите дату и сеанс 📅";
+                        keyboard = TicketsDateKeyboard();
+                    }
+                }
+                else
+                {
+                    switch (msg.ToLower())
+                    {
+                        case "/start":
+                        case "начать":
+                        case "🚀 начать":
+                            reply = "Добро пожаловать! Выберите пункт 👇";
+                            keyboard = MainMenuKeyboard();
+                            break;
+
+                        case "информация":
+                        case "ℹ️ информация":
+                            reply = "Выберите интересующую информацию 👇";
+                            keyboard = InfoMenuKeyboard();
+                            break;
+
+                        case "время работы":
+                        case "⏰ время работы":
+                            reply = GetWorkingHours();
+                            break;
+
+                        case "контакты":
+                        case "📞 контакты":
+                            reply = GetContacts();
+                            break;
+
+                        case "🔙 назад":
+                        case "назад":
+                            reply = "Главное меню:";
+                            keyboard = MainMenuKeyboard();
+                            userSelectedData.TryRemove(userId, out _);
+                            break;
+
+                        case "🔙 к сеансам":
+                            if (userSelectedData.TryGetValue(userId, out var sessionData))
+                            {
+                                reply = $"Выберите сеанс для даты {sessionData.date}:";
+                                var sessionResult = await ExecuteWithLoggingAsync(
+                                    () => GetSessionsForDateAsync(client, sessionData.date),
+                                    userId: userId,
+                                    command: "BACK_TO_SESSIONS",
+                                    contextData: new { Date = sessionData.date }
+                                );
+                                keyboard = sessionResult.keyboard;
+                            }
+                            else
+                            {
+                                reply = "Выберите дату для сеанса:";
+                                keyboard = TicketsDateKeyboard();
+                            }
+                            break;
+
+                        case "🔙 в начало":
+                            reply = "Главное меню:";
+                            keyboard = MainMenuKeyboard();
+                            userSelectedData.TryRemove(userId, out _);
+                            break;
+
+                        case "🎟 купить билеты":
+                        case "билеты":
+                            reply = "Выберите дату для сеанса:";
+                            keyboard = TicketsDateKeyboard();
+                            break;
+
+                        case "📊 загруженность":
+                        case "загруженность":
+                            reply = await ExecuteWithLoggingAsync(
+                                () => GetParkLoadAsync(client),
+                                userId: userId,
+                                command: "PARK_LOAD"
+                            );
+                            break;
+
+                        default:
+                            if (msg.StartsWith("📅")) // выбор даты
+                            {
+                                string dateStr = msg.Replace("📅", "").Trim();
+                                var sessionResult = await ExecuteWithLoggingAsync(
+                                    () => GetSessionsForDateAsync(client, dateStr),
+                                    userId: userId,
+                                    command: "SELECT_DATE",
+                                    contextData: new { SelectedDate = dateStr }
+                                );
+                                reply = sessionResult.message;
+                                keyboard = sessionResult.keyboard;
+
+                                // Сохраняем дату для пользователя
+                                userSelectedData[userId] = (dateStr, "");
+                            }
+                            else if (msg.StartsWith("⏰")) // выбор сеанса
+                            {
+                                string sessionTime = msg.Replace("⏰", "").Trim();
+
+                                // Получаем дату из предыдущего выбора пользователя
+                                if (!userSelectedData.TryGetValue(userId, out var currentData))
+                                {
+                                    reply = "Сначала выберите дату 📅";
+                                    keyboard = TicketsDateKeyboard();
+                                }
+                                else
+                                {
+                                    userSelectedData[userId] = (currentData.date, sessionTime);
+                                    reply = $"🎟 *Сеанс: {sessionTime} ({currentData.date})*\n\nВыберите категорию билетов:";
+                                    keyboard = TicketCategoryKeyboard();
+                                }
+                            }
+                            else
+                            {
+                                reply = "Я вас не понял, попробуйте еще раз 😅";
+                            }
+                            break;
+                    }
+                }
+
+                string sendUrl =
+                    $"https://api.vk.com/method/messages.send?user_id={userId}" +
+                    $"&random_id={Environment.TickCount}" +
+                    $"&message={Uri.EscapeDataString(reply)}" +
+                    $"&access_token={token}&v={apiVersion}";
+
+                if (keyboard != null)
+                    sendUrl += $"&keyboard={Uri.EscapeDataString(keyboard)}";
+
+                await ExecuteWithLoggingAsync(
+                    () => client.GetStringAsync(sendUrl),
+                    userId: userId,
+                    command: "SEND_MESSAGE",
+                    contextData: new { MessageLength = reply.Length, HasKeyboard = keyboard != null }
+                );
+            }
+            catch (Exception ex)
+            {
+                await _errorLogger!.LogErrorAsync(ex, "ERROR", userId,
+                    command: msg,
+                    additionalData: new
+                    {
+                        MessageText = msg,
+                        UserHasSelectedData = userSelectedData.ContainsKey(userId)
+                    });
+
+                // Отправляем сообщение об ошибке пользователю
+                string errorMessage = "Произошла ошибка при обработке запроса. Мы уже работаем над этим! 🛠️";
+                string errorUrl = $"https://api.vk.com/method/messages.send?user_id={userId}" +
+                                 $"&random_id={Environment.TickCount}" +
+                                 $"&message={Uri.EscapeDataString(errorMessage)}" +
+                                 $"&access_token={token}&v={apiVersion}";
+
+                await client.GetStringAsync(errorUrl);
+            }
+        }
+
+        // 🔧 Обертка для выполнения операций с логированием
+        private static async Task<T> ExecuteWithLoggingAsync<T>(
+            Func<Task<T>> operation,
+            HttpClient? client = null,
+            long? userId = null,
+            string? command = null,
+            object? contextData = null)
+        {
+            try
+            {
+                return await operation();
+            }
+            catch (Exception ex)
+            {
+                await _errorLogger!.LogErrorAsync(ex, "ERROR", userId, command: command, additionalData: contextData);
+                throw;
+            }
+        }
+
+        private static async Task ExecuteWithLoggingAsync(
+            Func<Task> operation,
+            HttpClient? client = null,
+            long? userId = null,
+            string? command = null,
+            object? contextData = null)
+        {
+            try
+            {
+                await operation();
+            }
+            catch (Exception ex)
+            {
+                await _errorLogger!.LogErrorAsync(ex, "ERROR", userId, command: command, additionalData: contextData);
+                throw;
             }
         }
 
